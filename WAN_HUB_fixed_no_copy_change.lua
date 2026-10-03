@@ -38,6 +38,7 @@ local COLORS = {
 -- ============================================================
 local copyBusy = false
 local updateBusy = false
+local copySystemEnabled = false
 local knownBlocks = {}
 
 
@@ -208,7 +209,6 @@ if not blocksFolder then
     warn("[BABFT] Blocks folder was not found; Copy/Update will be unavailable until it exists.")
 end
 local ignoreAnchored = true
-local rescaleClick = false
 local selectedPlayer = nil
 local usedList = {}
 
@@ -289,18 +289,53 @@ local function setTransparency(transparencyWanted, block)
     end)
 end
 
+-- Anchored/Gravity:
+-- ถ้าบล็อกเชื่อมกับบล็อกอื่นแล้ว ให้ใช้ไขควงตั้ง Anchored ได้ตั้งแต่ช่วงต้น
+-- ถ้าบล็อกยังลอยเดี่ยว/ยังไม่เชื่อม จะเลื่อนไปตั้ง Anchored ในขั้นตอนสุดท้าย
+-- เพื่อไม่ให้บล็อกลอยถูกล็อกเร็วเกินไป
 local function setAnchored(block)
-    if not block then return end
+    if not block then return false end
 
     local tool = equipTool("PropertiesTool")
-    if not tool or not tool:FindFirstChild("SetPropertieRF") then return end
+    if not tool or not tool:FindFirstChild("SetPropertieRF") then return false end
 
     local ok, err = pcall(function()
         tool.SetPropertieRF:InvokeServer("Anchored", {block})
     end)
     if not ok then
         warn("[BABFT] Anchored failed: " .. tostring(err))
+        return false
     end
+
+    return true
+end
+
+-- ตรวจว่าบล็อกนี้ต่อกับ "บล็อกอื่น" ในโฟลเดอร์ปลายทางแล้วหรือยัง
+-- ถ้าต่อแล้ว สามารถใช้แรงโน้มถ่วง/Anchored ได้ตั้งแต่ช่วงต้น
+-- ถ้ายังลอยเดี่ยว จะถูกเลื่อนไปทำใน final pass เท่านั้น
+local function isConnectedToOtherBlock(block, destinationFolder)
+    if not block or not destinationFolder then return false end
+
+    local ppart = block:FindFirstChild("PPart")
+    if not ppart or not ppart:IsA("BasePart") then return false end
+
+    local ok, connectedParts = pcall(function()
+        return ppart:GetConnectedParts(true)
+    end)
+    if not ok or type(connectedParts) ~= "table" then
+        return false
+    end
+
+    for _, part in ipairs(connectedParts) do
+        if part ~= ppart and part:IsA("BasePart") then
+            local otherModel = part:FindFirstAncestorOfClass("Model")
+            if otherModel and otherModel ~= block and otherModel.Parent == destinationFolder then
+                return true
+            end
+        end
+    end
+
+    return false
 end
 
 local function rescaleBlock(block, newPos, newSize)
@@ -518,7 +553,8 @@ local function placeAndVerify(expected, destinationFolder)
             task.wait(0.15 * attempt)
         end
 
-        placeBlock(expected.Name, expected.Pos, expected.Relative, expected.Anchored)
+        -- ห้ามตั้ง Anchored ตอนวาง เพราะบล็อกที่ยังลอยต้องรอขั้นตอนสุดท้าย
+        placeBlock(expected.Name, expected.Pos, expected.Relative, false)
 
         local deadline = os.clock() + (0.9 + attempt * 0.25)
         repeat
@@ -648,6 +684,11 @@ createCopyStatusUI()
 updateCopyStatus(0, 0, 0, false)
 
 local function runCopyBuild(targetPlayer)
+    if not copySystemEnabled then
+        notifyCustom("ระบบ Copy", "⛔ ระบบ Copy ถูกปิดอยู่ กรุณาเปิดสวิตช์ก่อน", 3, "⛔")
+        return
+    end
+
     if not canStartTask() then
         notifyCustom("คัดลอกสิ่งก่อสร้าง", "⚠️ มีงาน Copy/Update กำลังทำงานอยู่", 3, "⚠️")
         return
@@ -685,6 +726,7 @@ local function runCopyBuild(targetPlayer)
         local total = #build
         local placed = 0
         local failed = {}
+        local earlyAnchored = {}
 
         updateCopyStatus(total, 0, total, true)
         notifyCustom("คัดลอกสิ่งก่อสร้าง", "🔍 กำลังอ่านและวาง " .. total .. " บล็อก...", 4, "🏗️")
@@ -694,6 +736,16 @@ local function runCopyBuild(targetPlayer)
 
             if b then
                 placed += 1
+
+                -- ถ้าต่อกับบล็อกอื่นแล้ว ให้ตั้ง Anchored ได้ตั้งแต่ช่วงต้น
+                -- ถ้ายังลอยเดี่ยว จะรอ final pass ด้านล่าง
+                if expected.Anchored and isConnectedToOtherBlock(b, destinationFolder) then
+                    if setAnchored(b) then
+                        earlyAnchored[b] = true
+                    end
+                    task.wait(0.03)
+                end
+
                 local key = makeBlockKey(expected.Name, expected.Pos, expected.Size)
                 if key then knownBlocks[key] = true end
             else
@@ -719,6 +771,14 @@ local function runCopyBuild(targetPlayer)
                 local b = placeAndVerify(build[index], destinationFolder)
                 if b then
                     placed += 1
+
+                    if build[index].Anchored and isConnectedToOtherBlock(b, destinationFolder) then
+                        if setAnchored(b) then
+                            earlyAnchored[b] = true
+                        end
+                        task.wait(0.03)
+                    end
+
                     local key = makeBlockKey(build[index].Name, build[index].Pos, build[index].Size)
                     if key then knownBlocks[key] = true end
                 else
@@ -751,16 +811,31 @@ local function runCopyBuild(targetPlayer)
                     task.wait(0.03)
                 end
 
-                if v.Anchored then
-                    setAnchored(b)
-                    task.wait(0.03)
-                end
+                -- Anchored จะถูกตั้งในขั้นตอนสุดท้าย หลังปรับแต่งทุกอย่างครบแล้ว
 
                 edited += 1
             end
 
             if i % 15 == 0 then
                 task.wait(0.1)
+            end
+        end
+
+        -- ขั้นตอนสุดท้าย: ใช้ไขควงเฉพาะบล็อกที่ยังไม่ได้ Anchored ตั้งแต่ต้น
+        -- ซึ่งส่วนใหญ่คือบล็อกที่ตอนวางยังลอย/ยังไม่เชื่อมกับบล็อกอื่น
+        task.wait(0.15)
+        local finalCreated = destinationFolder:GetChildren()
+        local usedFinalBlocks = {}
+        for _, v in ipairs(build) do
+            if v.Anchored then
+                local b, dist = getBlock(v, finalCreated, usedFinalBlocks)
+                if b and dist <= 8 then
+                    usedFinalBlocks[b] = true
+                    if not earlyAnchored[b] then
+                        setAnchored(b)
+                        task.wait(0.03)
+                    end
+                end
             end
         end
 
@@ -787,6 +862,11 @@ end
 -- 4. UPDATE SYSTEM (Name + Position + Size Deduplication)
 -- ============================================================
 local function runUpdateBuild()
+    if not copySystemEnabled then
+        notifyCustom("ระบบ Copy", "⛔ ระบบ Copy/Update ถูกปิดอยู่ กรุณาเปิดสวิตช์ก่อน", 3, "⛔")
+        return
+    end
+
     if not canStartTask() then
         notifyCustom("อัปเดตสิ่งก่อสร้าง", "⚠️ มีงาน Copy/Update กำลังทำงานอยู่", 3, "⚠️")
         return
@@ -844,9 +924,19 @@ local function runUpdateBuild()
         local placedCount = 0
         local newlyPlacedInstances = {}
 
+        local earlyAnchoredUpdate = {}
+
         for _, item in ipairs(newBlocksToPlace) do
             local b = placeAndVerify(item.data, destinationFolder)
             if b then
+                -- ถ้าบล็อกใหม่เชื่อมกับบล็อกอื่นแล้ว ให้ใช้แรงโน้มถ่วงได้ทันที
+                if item.data.Anchored and isConnectedToOtherBlock(b, destinationFolder) then
+                    if setAnchored(b) then
+                        earlyAnchoredUpdate[b] = true
+                    end
+                    task.wait(0.03)
+                end
+
                 -- เพิ่มเข้า knownBlocks เมื่อวางสำเร็จจริงเท่านั้น
                 knownBlocks[item.key] = true
                 placedCount += 1
@@ -855,15 +945,22 @@ local function runUpdateBuild()
             task.wait(0.04)
         end
 
-        -- Customize newly created blocks
+        -- Customize newly created blocks (ยังไม่ตั้ง Anchored)
         for _, item in ipairs(newlyPlacedInstances) do
             rescaleBlock(item.instance, item.data.Pos, item.data.Size)
             paintBlock(item.instance, item.data.Color)
             if item.data.Transparency > 0 then
                 setTransparency(item.data.Transparency, item.instance)
             end
-            if item.data.Anchored then
+        end
+
+        -- ขั้นตอนสุดท้าย: ใช้ไขควงตั้ง Anchored/แรงโน้มถ่วง
+        -- ทำหลังจากบล็อกใหม่ทุกก้อนถูกวางและปรับแต่งเสร็จแล้ว
+        task.wait(0.15)
+        for _, item in ipairs(newlyPlacedInstances) do
+            if item.data.Anchored and not earlyAnchoredUpdate[item.instance] then
                 setAnchored(item.instance)
+                task.wait(0.03)
             end
         end
 
@@ -885,6 +982,7 @@ end
 local farmRunning = false
 local farmThread = nil
 local farmSpeed = 80
+local farmMode = "วาร์ป"
 
 -- พิกัดจากข้อมูลที่ให้ไว้ก่อนหน้า; ปรับได้จากตัวแปรนี้ภายหลัง
 local STAGE_WAYPOINTS = {
@@ -956,13 +1054,25 @@ local function startFarm()
             for _, waypoint in ipairs(STAGE_WAYPOINTS) do
                 if not farmRunning then break end
                 setCharacterCollision(false)
-                moveToPosition(waypoint, farmSpeed)
+                if farmMode == "วาร์ป" then
+                    if HRP and HRP.Parent then
+                        HRP.CFrame = CFrame.new(waypoint)
+                    end
+                else
+                    moveToPosition(waypoint, farmSpeed)
+                end
                 task.wait(0.08)
             end
 
             if farmRunning then
                 setCharacterCollision(false)
-                moveToPosition(CHEST_POS, farmSpeed)
+                if farmMode == "วาร์ป" then
+                    if HRP and HRP.Parent then
+                        HRP.CFrame = CFrame.new(CHEST_POS)
+                    end
+                else
+                    moveToPosition(CHEST_POS, farmSpeed)
+                end
                 task.wait(2)
             end
 
@@ -1088,24 +1198,30 @@ local selectedBaseType = "เปิดเผย"
 local travelMode = "วาร์ป"
 local travelSpeed = 80
 
-local baseOffsets = {
-    White = 0,
-    Red = -225,
-    Purple = -450,
-    Green = -675,
-    Blue = 225,
-    Yellow = 450,
-    Black = 675,
+-- พิกัดฐานอ้างอิงจากตำแหน่ง Team Zone ของแมพ
+-- White ใช้เป็นจุดกึ่งกลาง/จุดอ้างอิงหลัก
+local WHITE_BASE_POSITION = Vector3.new(-53.5637512, -9.89999294, -345.507538)
+
+-- ตำแหน่งจริงของฐานแต่ละสีที่สัมพันธ์กับ White
+-- Purple ใน UI ใช้ตำแหน่ง Magenta ของเกม
+local BASE_POSITIONS = {
+    White = WHITE_BASE_POSITION,
+    Red = Vector3.new(221.835068, -9.89999294, -68.7047195),
+    Purple = Vector3.new(221.835083, -9.89999294, 647.695251),
+    Green = Vector3.new(-328.966553, -9.89999294, 285.890778),
+    Blue = Vector3.new(221.835587, -9.89999294, 289.496735),
+    Yellow = Vector3.new(-328.942108, -9.89999294, 643.876709),
+    Black = Vector3.new(-328.943665, -9.89999294, -72.1218643),
 }
 
 local function getTravelCFrame()
-    local x = baseOffsets[selectedBaseColor]
-    if x == nil then return nil end
+    local position = BASE_POSITIONS[selectedBaseColor]
+    if not position then return nil end
 
-    local y = selectedBaseType == "ไม่เปิดเผย" and 75 or 33
-    local z = selectedBaseType == "ไม่เปิดเผย" and -710 or -580
-
-    return CFrame.new(x, y, z)
+    -- ประเภทจุดหมายใช้เป็น offset ความสูงเท่านั้น
+    local yOffset = selectedBaseType == "ไม่เปิดเผย" and 75 or 5
+    local target = position + Vector3.new(0, yOffset, 0)
+    return CFrame.new(target)
 end
 
 local function startTravel()
@@ -1316,6 +1432,19 @@ local Window = Rayfield:CreateWindow({
 -- COPY TAB: ใช้ฟังก์ชัน Copy/Update เดิมด้านบนโดยไม่แก้ logic
 local copyTab = Window:CreateTab("📋 Copy", "rewind")
 
+copyTab:CreateToggle({
+    Name = "📋 เปิด/ปิด ระบบ Copy/Update",
+    CurrentValue = false,
+    Callback = function(value)
+        copySystemEnabled = value == true
+        if copySystemEnabled then
+            notifyCustom("ระบบ Copy", "✅ เปิดใช้งาน Copy/Update แล้ว", 3, "✅")
+        else
+            notifyCustom("ระบบ Copy", "⛔ ปิดใช้งาน Copy/Update แล้ว", 3, "⛔")
+        end
+    end,
+})
+
 local playerDropdown = copyTab:CreateDropdown({
     Name = "👤 เลือกผู้เล่น",
     Options = getPlayers(),
@@ -1370,14 +1499,6 @@ copyTab:CreateButton({
     end,
 })
 
-copyTab:CreateToggle({
-    Name = "📐 ปรับขนาดบล็อกเมื่อคลิก",
-    CurrentValue = false,
-    Callback = function(value)
-        rescaleClick = value
-    end,
-})
-
 
 -- FARM TAB
 local farmTab = Window:CreateTab("🪙 Farm", "dollar-sign")
@@ -1394,14 +1515,24 @@ farmTab:CreateToggle({
     end,
 })
 
+farmTab:CreateDropdown({
+    Name = "🧭 วิธีฟาร์ม",
+    Options = {"วาร์ป", "บิน"},
+    CurrentOption = {"วาร์ป"},
+    MultipleOptions = false,
+    Callback = function(option)
+        farmMode = type(option) == "table" and option[1] or option
+    end,
+})
+
 farmTab:CreateSlider({
     Name = "🚀 ความเร็ว Farm",
-    Range = {1, 50},
+    Range = {1, 200},
     Increment = 1,
     Suffix = "",
-    CurrentValue = 50,
+    CurrentValue = 80,
     Callback = function(value)
-        farmSpeed = math.clamp(tonumber(value) or 50, 1, 50) * 2
+        farmSpeed = math.clamp(tonumber(value) or 80, 1, 200)
     end,
 })
 
@@ -1460,12 +1591,12 @@ travelTab:CreateDropdown({
 
 travelTab:CreateSlider({
     Name = "🚀 ความเร็วบิน",
-    Range = {1, 50},
+    Range = {1, 200},
     Increment = 1,
     Suffix = "",
-    CurrentValue = 50,
+    CurrentValue = 80,
     Callback = function(value)
-        travelSpeed = math.clamp(tonumber(value) or 50, 1, 50) * 2
+        travelSpeed = math.clamp(tonumber(value) or 80, 1, 200)
     end,
 })
 
@@ -1627,21 +1758,8 @@ settingsTab:CreateButton({
 
 
 -- ============================================================
--- 13. RESCALE CLICK + PLAYER LISTENERS
+-- 13. PLAYER LISTENERS
 -- ============================================================
-local mouse = player:GetMouse()
-
-mouse.Button1Down:Connect(function()
-    if not rescaleClick or not mouse.Target then return end
-
-    local target = mouse.Target
-    local model = target:FindFirstAncestorOfClass("Model")
-
-    if model and model:FindFirstChild("PPart") then
-        rescaleBlock(model, target.CFrame, Vector3.new(4, 4, 4))
-        notifyCustom("Rescale", "📐 ปรับขนาดบล็อกเป็น 4×4×4 แล้ว", 2, "📐")
-    end
-end)
 
 local function refreshPlayerLists()
     pcall(function()
