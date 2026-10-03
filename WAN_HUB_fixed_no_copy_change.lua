@@ -5,11 +5,13 @@ local players = game:GetService("Players")
 local workspace = game:GetService("Workspace")
 local TweenService = game:GetService("TweenService")
 local VirtualUser = game:GetService("VirtualUser")
+local RunService = game:GetService("RunService")
 
 local player = players.LocalPlayer
 local character
 local humanoid
 local HRP
+local viewEnabled = false
 
 local function refreshCharacter()
     character = player.Character or player.CharacterAdded:Wait()
@@ -18,15 +20,6 @@ local function refreshCharacter()
 end
 
 refreshCharacter()
-
-player.CharacterAdded:Connect(function()
-    task.wait()
-    refreshCharacter()
-    if not viewEnabled then
-        local camera = workspace.CurrentCamera
-        if camera and humanoid then camera.CameraSubject = humanoid end
-    end
-end)
 
 -- COLOR PALETTE CONSTANTS (Milky Blue & Mint Theme)
 local COLORS = {
@@ -46,6 +39,7 @@ local COLORS = {
 local copyBusy = false
 local updateBusy = false
 local knownBlocks = {}
+
 
 local function canStartTask()
     return not copyBusy and not updateBusy
@@ -204,8 +198,15 @@ end
 -- ============================================================
 -- 3. COPY SYSTEM (SOURCE OF TRUTH - UNMODIFIED ORIGINAL LOGIC)
 -- ============================================================
-local blockData = player:WaitForChild("Data")
-local blocksFolder = workspace:WaitForChild("Blocks")
+local blockData = player:FindFirstChild("Data") or player:WaitForChild("Data", 15)
+local blocksFolder = workspace:FindFirstChild("Blocks") or workspace:WaitForChild("Blocks", 15)
+
+if not blockData then
+    warn("[BABFT] Data folder was not found; block limits will use defaults.")
+end
+if not blocksFolder then
+    warn("[BABFT] Blocks folder was not found; Copy/Update will be unavailable until it exists.")
+end
 local ignoreAnchored = true
 local rescaleClick = false
 local selectedPlayer = nil
@@ -245,8 +246,8 @@ local function equipTool(toolName)
 end
 
 local function getBlockID(name)
-    local value = blockData:FindFirstChild(name)
-    return value and value.Value or 9
+    local value = blockData and blockData:FindFirstChild(name)
+    return value and tonumber(value.Value) or 9
 end
 
 local function getPlayerZone(playerInstance)
@@ -277,7 +278,7 @@ local function setTransparency(transparencyWanted, block)
     task.spawn(function()
         for _ = 1, calls do
             local ok, err = pcall(function()
-                tool.SetPropertieRF:InvokeServer(unpack(args))
+                tool.SetPropertieRF:InvokeServer(table.unpack(args))
             end)
             if not ok then
                 warn("[BABFT] Transparency failed: " .. tostring(err))
@@ -335,7 +336,7 @@ local function placeBlock(name, pos, relativeTo, anchored)
     }
 
     local ok, err = pcall(function()
-        tool.RF:InvokeServer(unpack(args))
+        tool.RF:InvokeServer(table.unpack(args))
     end)
     if not ok then
         warn("[BABFT] Place failed: " .. tostring(err))
@@ -441,12 +442,12 @@ local function getMissingBlocks(expectedList, createdList)
     return missing
 end
 
-local function getBlock(expected, createdList)
+local function getBlock(expected, createdList, usedInstances)
     local best = nil
     local bestDist = math.huge
 
     for _, b in ipairs(createdList) do
-        if b and b:IsA("Model") and b.Name == expected.Name then
+        if b and not (usedInstances and usedInstances[b]) and b:IsA("Model") and b.Name == expected.Name then
             local ppart = b:FindFirstChild("PPart")
             if ppart and ppart:IsA("BasePart") then
                 local dist = (ppart.Position - expected.Pos.Position).Magnitude
@@ -482,7 +483,8 @@ end
 
 local function getSourceFolder(p)
     if not p then return nil end
-    return blocksFolder:FindFirstChild(p.Name)
+    local folder = blocksFolder or workspace:FindFirstChild("Blocks")
+    return folder and folder:FindFirstChild(p.Name) or nil
 end
 
 local function findPlacedBlock(folder, expected, tolerance)
@@ -671,7 +673,8 @@ local function runCopyBuild(targetPlayer)
             return
         end
 
-        local destinationFolder = blocksFolder:FindFirstChild(player.Name)
+        local currentBlocksFolder = blocksFolder or workspace:FindFirstChild("Blocks")
+        local destinationFolder = currentBlocksFolder and currentBlocksFolder:FindFirstChild(player.Name)
         if not destinationFolder then
             notifyCustom("คัดลอกสิ่งก่อสร้าง", "⚠️ ไม่พบโฟลเดอร์สิ่งก่อสร้างของเรา", 4, "⚠️")
             return
@@ -730,11 +733,13 @@ local function runCopyBuild(targetPlayer)
         task.wait(0.4)
         local created = destinationFolder:GetChildren()
         local edited = 0
+        local usedCreatedBlocks = {}
 
         for i, v in ipairs(build) do
-            local b, dist = getBlock(v, created)
+            local b, dist = getBlock(v, created, usedCreatedBlocks)
 
             if b and dist <= 8 then
+                usedCreatedBlocks[b] = true
                 rescaleBlock(b, v.Pos, v.Size)
                 task.wait(0.03)
 
@@ -814,7 +819,8 @@ local function runUpdateBuild()
             return
         end
 
-        local destinationFolder = blocksFolder:FindFirstChild(player.Name)
+        local currentBlocksFolder = blocksFolder or workspace:FindFirstChild("Blocks")
+        local destinationFolder = currentBlocksFolder and currentBlocksFolder:FindFirstChild(player.Name)
         if not destinationFolder then
             notifyCustom("อัปเดตสิ่งก่อสร้าง", "⚠️ ไม่พบโฟลเดอร์สิ่งก่อสร้างของเรา", 4, "⚠️")
             return
@@ -1171,7 +1177,6 @@ end
 -- ============================================================
 -- 9. VIEW SYSTEM
 -- ============================================================
-local viewEnabled = false
 local viewSelectedPlayer = nil
 local viewDropdown = nil
 
@@ -1266,7 +1271,31 @@ end)
 -- ============================================================
 -- 12. UI SYSTEM
 -- ============================================================
-local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+local Rayfield
+do
+    local ok, result = pcall(function()
+        if type(loadstring) ~= "function" then
+            error("loadstring is not available in this executor")
+        end
+        local source = game:HttpGet("https://sirius.menu/rayfield")
+        if type(source) ~= "string" or source == "" then
+            error("Rayfield source could not be downloaded")
+        end
+        local chunk, compileErr = loadstring(source)
+        if not chunk then
+            error(compileErr or "Rayfield source failed to compile")
+        end
+        return chunk()
+    end)
+
+    if not ok or type(result) ~= "table" then
+        warn("[WAN HUB] Rayfield failed to load: " .. tostring(result))
+        notifyCustom("WAN HUB", "❌ โหลด Rayfield ไม่สำเร็จ กรุณาใช้ executor ที่รองรับ loadstring + HttpGet", 8, "❌")
+        error("[WAN HUB] Rayfield failed to load: " .. tostring(result))
+    end
+
+    Rayfield = result
+end
 
 local Window = Rayfield:CreateWindow({
     Name = "WAN HUB — Build A Boat",
